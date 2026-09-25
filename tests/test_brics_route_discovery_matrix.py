@@ -1,0 +1,843 @@
+import argparse
+import json
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from ai.model_interface import AIModel
+from ai.ollama_ai import OllamaAI
+from intent.value_transfer_intent import ValueTransferIntent
+from route_discovery.route_discovery_agent import RouteDiscoveryAgent
+
+
+# ---------------------------------------------------------------------------
+# BRICS COUNTRY UNIVERSE
+# ---------------------------------------------------------------------------
+#
+# Current BRICS structure:
+#
+#   11 MEMBER COUNTRIES
+#   10 PARTNER COUNTRIES
+#   -------------------
+#   21 TOTAL COUNTRIES
+#
+# ISO-style country codes are used for stable intent IDs.
+#
+# ---------------------------------------------------------------------------
+
+BRICS_COUNTRIES = [
+    # Members
+    {
+        "country": "Brazil",
+        "code": "BR",
+        "currency": "BRL",
+        "category": "MEMBER",
+    },
+    {
+        "country": "Russia",
+        "code": "RU",
+        "currency": "RUB",
+        "category": "MEMBER",
+    },
+    {
+        "country": "India",
+        "code": "IN",
+        "currency": "INR",
+        "category": "MEMBER",
+    },
+    {
+        "country": "China",
+        "code": "CN",
+        "currency": "CNY",
+        "category": "MEMBER",
+    },
+    {
+        "country": "South Africa",
+        "code": "ZA",
+        "currency": "ZAR",
+        "category": "MEMBER",
+    },
+    {
+        "country": "Saudi Arabia",
+        "code": "SA",
+        "currency": "SAR",
+        "category": "MEMBER",
+    },
+    {
+        "country": "Egypt",
+        "code": "EG",
+        "currency": "EGP",
+        "category": "MEMBER",
+    },
+    {
+        "country": "United Arab Emirates",
+        "code": "AE",
+        "currency": "AED",
+        "category": "MEMBER",
+    },
+    {
+        "country": "Ethiopia",
+        "code": "ET",
+        "currency": "ETB",
+        "category": "MEMBER",
+    },
+    {
+        "country": "Iran",
+        "code": "IR",
+        "currency": "IRR",
+        "category": "MEMBER",
+    },
+    {
+        "country": "Indonesia",
+        "code": "ID",
+        "currency": "IDR",
+        "category": "MEMBER",
+    },
+
+    # Partners
+    {
+        "country": "Belarus",
+        "code": "BY",
+        "currency": "BYN",
+        "category": "PARTNER",
+    },
+    {
+        "country": "Bolivia",
+        "code": "BO",
+        "currency": "BOB",
+        "category": "PARTNER",
+    },
+    {
+        "country": "Cuba",
+        "code": "CU",
+        "currency": "CUP",
+        "category": "PARTNER",
+    },
+    {
+        "country": "Kazakhstan",
+        "code": "KZ",
+        "currency": "KZT",
+        "category": "PARTNER",
+    },
+    {
+        "country": "Malaysia",
+        "code": "MY",
+        "currency": "MYR",
+        "category": "PARTNER",
+    },
+    {
+        "country": "Nigeria",
+        "code": "NG",
+        "currency": "NGN",
+        "category": "PARTNER",
+    },
+    {
+        "country": "Thailand",
+        "code": "TH",
+        "currency": "THB",
+        "category": "PARTNER",
+    },
+    {
+        "country": "Uganda",
+        "code": "UG",
+        "currency": "UGX",
+        "category": "PARTNER",
+    },
+    {
+        "country": "Uzbekistan",
+        "code": "UZ",
+        "currency": "UZS",
+        "category": "PARTNER",
+    },
+    {
+        "country": "Vietnam",
+        "code": "VN",
+        "currency": "VND",
+        "category": "PARTNER",
+    },
+]
+
+
+MATRIX_VERSION = "BRICS-21-MEMBER-PARTNER-V1"
+
+OUTPUT_DIR = Path("test_results")
+OUTPUT_FILE = OUTPUT_DIR / "brics_21_route_discovery_matrix.json"
+
+DEFAULT_AMOUNT = 100000
+DEFAULT_DELIVERY_TIME = "24h"
+DEFAULT_PAUSE_SECONDS = 1
+
+
+# ---------------------------------------------------------------------------
+# RECORDING AI
+# ---------------------------------------------------------------------------
+#
+# This wrapper preserves the actual raw model response.
+#
+# The RouteDiscoveryAgent validates/parses the response internally.
+# If validation fails, the raw response would otherwise be lost.
+#
+# RecordingAI lets the matrix retain that response for analysis.
+#
+# ---------------------------------------------------------------------------
+
+
+class RecordingAI(AIModel):
+
+    def __init__(self, wrapped_ai: AIModel):
+        self.wrapped_ai = wrapped_ai
+        self.calls = []
+
+    def generate(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> str:
+
+        response = self.wrapped_ai.generate(
+            system_prompt,
+            user_prompt,
+        )
+
+        self.calls.append({
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "response": response,
+        })
+
+        return response
+
+    @property
+    def last_response(self):
+        if not self.calls:
+            return None
+
+        return self.calls[-1]["response"]
+
+
+# ---------------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------------
+
+
+def build_intent(
+    source: dict,
+    destination: dict,
+    sequence: int,
+) -> ValueTransferIntent:
+
+    return ValueTransferIntent(
+        intent_id=(
+            f"VTI-BRICS-"
+            f"{source['code']}-"
+            f"{destination['code']}-"
+            f"{sequence:03d}"
+        ),
+        from_country=source["country"],
+        to_country=destination["country"],
+        amount=DEFAULT_AMOUNT,
+        source_currency=source["currency"],
+        destination_currency=destination["currency"],
+        required_delivery_time=DEFAULT_DELIVERY_TIME,
+    )
+
+
+def route_to_dict(route):
+
+    return {
+        "route_id": route.route_id,
+        "rail": route.rail,
+        "source": {
+            "country": route.source.country,
+            "currency": route.source.currency,
+        },
+        "destination": {
+            "country": route.destination.country,
+            "currency": route.destination.currency,
+        },
+        "funding_method": route.funding_method,
+        "transfer_path": list(route.transfer_path),
+        "delivery_method": route.delivery_method,
+        "corridor_availability": route.corridor_availability,
+        "route_requirements": list(route.route_requirements),
+    }
+
+
+def country_metadata(country_name: str):
+
+    for country in BRICS_COUNTRIES:
+        if country["country"] == country_name:
+            return country
+
+    raise ValueError(
+        f"Country not found in BRICS universe: {country_name}"
+    )
+
+
+def create_empty_output(total_corridors: int):
+
+    return {
+        "test": "BRICS_ROUTE_DISCOVERY_MATRIX",
+        "matrix_version": MATRIX_VERSION,
+        "model": "qwen3:4b",
+        "generated_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "countries": BRICS_COUNTRIES,
+        "country_count": len(BRICS_COUNTRIES),
+        "member_count": sum(
+            1
+            for country in BRICS_COUNTRIES
+            if country["category"] == "MEMBER"
+        ),
+        "partner_count": sum(
+            1
+            for country in BRICS_COUNTRIES
+            if country["category"] == "PARTNER"
+        ),
+        "total_directed_corridors": total_corridors,
+        "default_amount": DEFAULT_AMOUNT,
+        "default_delivery_time": DEFAULT_DELIVERY_TIME,
+        "results": [],
+    }
+
+
+def load_existing_output():
+
+    if not OUTPUT_FILE.exists():
+        return None
+
+    try:
+        data = json.loads(
+            OUTPUT_FILE.read_text(
+                encoding="utf-8"
+            )
+        )
+    except Exception:
+        return None
+
+    if data.get("matrix_version") != MATRIX_VERSION:
+        return None
+
+    return data
+
+
+def save_output(output):
+
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    OUTPUT_FILE.write_text(
+        json.dumps(
+            output,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def build_result_index(output):
+
+    return {
+        result["intent"]["intent_id"]: result
+        for result in output["results"]
+    }
+
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run AI route discovery across all directed "
+            "BRICS member/partner country corridors."
+        )
+    )
+
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "Optional maximum number of corridors to process "
+            "during this execution."
+        ),
+    )
+
+    parser.add_argument(
+        "--pause",
+        type=float,
+        default=DEFAULT_PAUSE_SECONDS,
+        help=(
+            "Pause in seconds between model calls."
+        ),
+    )
+
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "Ignore an existing matrix result and start again."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    country_count = len(BRICS_COUNTRIES)
+
+    total_corridors = (
+        country_count *
+        (country_count - 1)
+    )
+
+    # -----------------------------------------------------------------------
+    # OUTPUT / RESUME
+    # -----------------------------------------------------------------------
+
+    if args.fresh:
+        output = create_empty_output(
+            total_corridors
+        )
+    else:
+        output = load_existing_output()
+
+        if output is None:
+            output = create_empty_output(
+                total_corridors
+            )
+
+    existing_results = build_result_index(
+        output
+    )
+
+    # -----------------------------------------------------------------------
+    # AI
+    # -----------------------------------------------------------------------
+
+    base_ai = OllamaAI(
+        model_name="qwen3:4b",
+    )
+
+    ai = RecordingAI(
+        base_ai
+    )
+
+    discovery_agent = RouteDiscoveryAgent(
+        ai
+    )
+
+    # -----------------------------------------------------------------------
+    # HEADER
+    # -----------------------------------------------------------------------
+
+    print()
+    print("=" * 80)
+    print(
+        "BRICS 21-COUNTRY CROSS-BORDER "
+        "ROUTE DISCOVERY MATRIX"
+    )
+    print("=" * 80)
+
+    print(
+        f"Members:          "
+        f"{sum(c['category'] == 'MEMBER' for c in BRICS_COUNTRIES)}"
+    )
+
+    print(
+        f"Partners:         "
+        f"{sum(c['category'] == 'PARTNER' for c in BRICS_COUNTRIES)}"
+    )
+
+    print(
+        f"Total countries:  "
+        f"{country_count}"
+    )
+
+    print(
+        f"Directed corridors: "
+        f"{total_corridors}"
+    )
+
+    print(
+        f"Model:            "
+        f"{base_ai.model_name}"
+    )
+
+    print(
+        f"Existing results: "
+        f"{len(existing_results)}"
+    )
+
+    print()
+
+    processed_this_run = 0
+
+    # -----------------------------------------------------------------------
+    # MATRIX
+    # -----------------------------------------------------------------------
+
+    for source in BRICS_COUNTRIES:
+
+        for destination in BRICS_COUNTRIES:
+
+            if source["country"] == destination["country"]:
+                continue
+
+            intent_number = (
+                len(
+                    [
+                        1
+                        for s in BRICS_COUNTRIES
+                        for d in BRICS_COUNTRIES
+                        if s["country"] != d["country"]
+                        and (
+                            BRICS_COUNTRIES.index(s)
+                            <
+                            BRICS_COUNTRIES.index(d)
+                        )
+                    ]
+                )
+            )
+
+            # Stable sequence based on matrix position.
+            source_index = BRICS_COUNTRIES.index(
+                source
+            )
+
+            destination_index = BRICS_COUNTRIES.index(
+                destination
+            )
+
+            sequence = (
+                source_index * (country_count - 1)
+            )
+
+            destination_offset = (
+                destination_index
+                if destination_index < source_index
+                else destination_index - 1
+            )
+
+            sequence += destination_offset + 1
+
+            intent = build_intent(
+                source,
+                destination,
+                sequence,
+            )
+
+            # ---------------------------------------------------------------
+            # RESUME
+            # ---------------------------------------------------------------
+
+            if intent.intent_id in existing_results:
+                continue
+
+            if (
+                args.limit is not None
+                and processed_this_run >= args.limit
+            ):
+                break
+
+            processed_this_run += 1
+
+            # ---------------------------------------------------------------
+            # CORRIDOR
+            # ---------------------------------------------------------------
+
+            print("-" * 80)
+
+            print(
+                f"[{sequence}/{total_corridors}] "
+                f"{source['country']} "
+                f"({source['category']}) "
+                f"-> "
+                f"{destination['country']} "
+                f"({destination['category']})"
+            )
+
+            print(
+                f"Intent: {intent.intent_id} | "
+                f"{intent.amount} "
+                f"{intent.source_currency} -> "
+                f"{intent.destination_currency} | "
+                f"delivery={intent.required_delivery_time}"
+            )
+
+            started_at = datetime.now(
+                timezone.utc
+            )
+
+            raw_ai_response = None
+
+            try:
+
+                routes = discovery_agent.discover(
+                    intent
+                )
+
+                raw_ai_response = (
+                    ai.last_response
+                )
+
+                completed_at = datetime.now(
+                    timezone.utc
+                )
+
+                route_records = [
+                    route_to_dict(route)
+                    for route in routes
+                ]
+
+                result = {
+                    "sequence": sequence,
+                    "intent": {
+                        "intent_id": intent.intent_id,
+                        "from_country": (
+                            intent.from_country
+                        ),
+                        "to_country": (
+                            intent.to_country
+                        ),
+                        "from_category": (
+                            source["category"]
+                        ),
+                        "to_category": (
+                            destination["category"]
+                        ),
+                        "amount": intent.amount,
+                        "source_currency": (
+                            intent.source_currency
+                        ),
+                        "destination_currency": (
+                            intent.destination_currency
+                        ),
+                        "required_delivery_time": (
+                            intent.required_delivery_time
+                        ),
+                    },
+                    "status": "PASS",
+                    "started_at": (
+                        started_at.isoformat()
+                    ),
+                    "completed_at": (
+                        completed_at.isoformat()
+                    ),
+                    "route_count": (
+                        len(route_records)
+                    ),
+                    "routes": route_records,
+                    "raw_ai_response": (
+                        raw_ai_response
+                    ),
+                }
+
+                print(
+                    f"Routes discovered: "
+                    f"{len(route_records)}"
+                )
+
+                for route in routes:
+                    print(
+                        f"  - {route.route_id} | "
+                        f"{route.rail} | "
+                        f"{route.funding_method} | "
+                        f"{route.delivery_method}"
+                    )
+
+            except Exception as exc:
+
+                raw_ai_response = (
+                    ai.last_response
+                )
+
+                completed_at = datetime.now(
+                    timezone.utc
+                )
+
+                result = {
+                    "sequence": sequence,
+                    "intent": {
+                        "intent_id": intent.intent_id,
+                        "from_country": (
+                            intent.from_country
+                        ),
+                        "to_country": (
+                            intent.to_country
+                        ),
+                        "from_category": (
+                            source["category"]
+                        ),
+                        "to_category": (
+                            destination["category"]
+                        ),
+                        "amount": intent.amount,
+                        "source_currency": (
+                            intent.source_currency
+                        ),
+                        "destination_currency": (
+                            intent.destination_currency
+                        ),
+                        "required_delivery_time": (
+                            intent.required_delivery_time
+                        ),
+                    },
+                    "status": "ERROR",
+                    "started_at": (
+                        started_at.isoformat()
+                    ),
+                    "completed_at": (
+                        completed_at.isoformat()
+                    ),
+                    "route_count": 0,
+                    "routes": [],
+                    "error": str(exc),
+                    "raw_ai_response": (
+                        raw_ai_response
+                    ),
+                }
+
+                print(
+                    f"ERROR: {exc}"
+                )
+
+                if raw_ai_response:
+                    print(
+                        "Raw AI response preserved."
+                    )
+
+            # ---------------------------------------------------------------
+            # SAVE IMMEDIATELY
+            # ---------------------------------------------------------------
+
+            output["results"].append(
+                result
+            )
+
+            existing_results[
+                intent.intent_id
+            ] = result
+
+            save_output(
+                output
+            )
+
+            if args.pause > 0:
+                time.sleep(
+                    args.pause
+                )
+
+        if (
+            args.limit is not None
+            and processed_this_run >= args.limit
+        ):
+            break
+
+    # -----------------------------------------------------------------------
+    # SUMMARY
+    # -----------------------------------------------------------------------
+
+    passed = sum(
+        1
+        for result in output["results"]
+        if result["status"] == "PASS"
+    )
+
+    failed = sum(
+        1
+        for result in output["results"]
+        if result["status"] == "ERROR"
+    )
+
+    total_routes = sum(
+        result["route_count"]
+        for result in output["results"]
+    )
+
+    completed = len(
+        output["results"]
+    )
+
+    remaining = (
+        total_corridors - completed
+    )
+
+    output["summary"] = {
+        "completed_corridors": completed,
+        "remaining_corridors": remaining,
+        "passed_corridors": passed,
+        "error_corridors": failed,
+        "total_candidate_routes": total_routes,
+        "average_routes_per_completed_corridor": (
+            total_routes / completed
+            if completed
+            else 0
+        ),
+        "updated_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+    }
+
+    save_output(
+        output
+    )
+
+    print()
+    print("=" * 80)
+    print(
+        "BRICS ROUTE DISCOVERY MATRIX SUMMARY"
+    )
+    print("=" * 80)
+
+    print(
+        f"Total countries:       {country_count}"
+    )
+
+    print(
+        f"Directed corridors:     {total_corridors}"
+    )
+
+    print(
+        f"Completed:              {completed}"
+    )
+
+    print(
+        f"Remaining:              {remaining}"
+    )
+
+    print(
+        f"Passed:                 {passed}"
+    )
+
+    print(
+        f"Errors:                 {failed}"
+    )
+
+    print(
+        f"Candidate routes:       {total_routes}"
+    )
+
+    if completed:
+        print(
+            "Average routes/corridor:"
+            f" {total_routes / completed:.2f}"
+        )
+
+    print()
+    print(
+        f"Results saved: "
+        f"{OUTPUT_FILE}"
+    )
+
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    main()
